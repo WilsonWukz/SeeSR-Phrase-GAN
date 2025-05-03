@@ -3,7 +3,15 @@
    </a>
 </div>
 
-      
+# SeeSR Project
+
+This is an image super-resolution project based on SeeSR, with phrase enhancement added. 
+
+## 💡New Features
+- Generate "attributive + noun" phrases to enhance text description
+- Support custom vocabulary and combination rules
+
+Here is the SeeSR:
 ## SeeSR: Towards Semantics-Aware Real-World Image Super-Resolution (CVPR2024)
 
 <a href='https://arxiv.org/abs/2311.16518'><img src='https://img.shields.io/badge/arXiv-2311.16518-b31b1b.svg'></a> &nbsp;&nbsp;
@@ -28,11 +36,6 @@
   - 📏 We also release `RealLR200`. It includes 200 real-world low-resolution images.
 - **2023.11.28** Create this repo.
 
-### 📌 TODO
-- [ ] SeeSR-SDXL
-- [ ] SeeSR-SD2-Base-face,text
-- [ ] ~~SeeSR Acceleration~~
-
 ## 🔎 Overview framework
 ![seesr](figs/framework.png)
 
@@ -40,17 +43,13 @@
 [<img src="figs/building.png" height="320px"/>](https://imgsli.com/MjI5MTA2) [<img src="figs/person1.png" height="320px"/>](https://imgsli.com/MjI5MTA3)
 [<img src="figs/nature.png" height="320px"/>](https://imgsli.com/MjI5MTA0) [<img src="figs/bird1.png" height="320px"/>](https://imgsli.com/MjI5MTA1) 
 
-
-
-
-
 ![seesr](figs/data_real_suppl.jpg)
 
 ## ⚙️ Dependencies and Installation
 ```
 ## git clone this repository
-git clone https://github.com/cswry/SeeSR.git
-cd SeeSR
+git clone https://github.com/WilsonWukz/SeeSR-Phrase-GAN.git
+cd SeeSR-new
 
 # create an environment with python >= 3.8
 conda create -n seesr python=3.8
@@ -80,7 +79,8 @@ python test_seesr.py \
 --start_point lr \
 --num_inference_steps 50 \
 --guidance_scale 5.5 \
---process_size 512 
+--process_size 512 \
+--use_phrase_enhancement
 ```
 More details are [here](asserts/hyp.md)
 
@@ -201,10 +201,10 @@ The overall batch size is determined by num of `CUDA_VISIBLE_DEVICES`, `--train_
 This project is based on [diffusers](https://github.com/huggingface/diffusers) and [BasicSR](https://github.com/XPixelGroup/BasicSR). Some codes are brought from [PASD](https://github.com/yangxy/PASD) and [RAM](https://github.com/xinyu1205/recognize-anything). Thanks for their awesome works. We also pay tribute to the pioneering work of [StableSR](https://github.com/IceClear/StableSR).
 
 ## 📧 Contact
-If you have any questions, please feel free to contact: `rong-yuan.wu@connect.polyu.hk`
+If you have any questions, please feel free to visit the SeeSR page: https://github.com/cswry/SeeSR
 
 ## 🎓Citations
-If our code helps your research or work, please consider citing our paper.
+If the code helps your research or work, please consider citing their paper.
 The following are BibTeX references:
 
 ```
@@ -216,14 +216,3 @@ The following are BibTeX references:
   year={2024}
 }
 ```
-
-## 🎫 License
-This project and related weights are released under the [Apache 2.0 license](LICENSE).
-
-
-<details>
-<summary>statistics</summary>
-
-![visitors](https://visitor-badge.laobi.icu/badge?page_id=cswry/SeeSR)
-
-</details>
