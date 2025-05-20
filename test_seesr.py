@@ -5,16 +5,18 @@
 '''
 import os
 import sys
+
+from models.prompt_gan import PromptEnhancementGenerator
+from transformers import CLIPTokenizer, CLIPTextModel
 sys.path.append(os.getcwd())
 import cv2
 import glob
 import argparse
 import numpy as np
 from PIL import Image
-
 import torch
 import torch.utils.checkpoint
-
+from transformers import AutoTokenizer
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
@@ -22,7 +24,7 @@ from diffusers import AutoencoderKL, DDPMScheduler
 from diffusers.utils import check_min_version
 from diffusers.utils.import_utils import is_xformers_available
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPImageProcessor
-
+from models import prompt_gan
 from pipelines.pipeline_seesr import StableDiffusionControlNetPipeline
 from utils.misc import load_dreambooth_lora
 from utils.wavelet_color_fix import wavelet_color_fix, adain_color_fix
@@ -38,8 +40,13 @@ import torch.nn.functional as F
 from torchvision import transforms
 from utils_text.phrase_generator import PhraseGenerator
 
-logger = get_logger(__name__, log_level="INFO")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+project_tag_embeds = nn.Linear(768, 1024).to(device)
+decode_tag_embeds  = nn.Linear(1024, 768).to(device)
+
+logger = get_logger(__name__, log_level="INFO")
+bert_tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
 tensor_transforms = transforms.Compose([
                 transforms.ToTensor(),
@@ -49,6 +56,11 @@ ram_transforms = transforms.Compose([
             transforms.Resize((384, 384)),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
+
+# 设定设备
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+project_tag_embeds = None
+
 def load_state_dict_diffbirSwinIR(model: nn.Module, state_dict: Mapping[str, Any], strict: bool=False) -> None:
     state_dict = state_dict.get("state_dict", state_dict)
     
@@ -132,31 +144,113 @@ def load_tag_model(args, device='cuda'):
     
     return model
 
-phrase_generator = PhraseGenerator("F:/PyCharmProjects/SeeSR/lexicon.json")
+# phrase_generator = PhraseGenerator("F:/PyCharmProjects/SeeSR/lexicon.json")
 
-def get_validation_prompt(args, image, model, device='cuda'):
-    validation_prompt = ""
- 
+def load_gan_model(args, device='cuda'):
+    model = PromptEnhancementGenerator(tag_dim=1024, image_embed_dim=512, hidden_dim=1024)
+    if args.gan_model_path:
+        model.load_state_dict(torch.load(args.gan_model_path))
+    model.eval()
+    model.to(device)
+    return model
+
+def get_validation_prompt(
+    args,
+    image: Image.Image,
+    tag_model,
+    tokenizer,
+    text_encoder,
+    project_tag_embeds=None,
+    decode_tag_embeds=None,
+    gan_model=None,
+    device='cuda',
+    top_k: int = 5
+):
+    print(f"[DEBUG] tokenizer type: {type(tokenizer)}")
+    print(f"[DEBUG] gan_model type: {type(gan_model)}")
+
+    # 1) 预处理图像
     lq = tensor_transforms(image).unsqueeze(0).to(device)
     lq = ram_transforms(lq)
-    res = inference(lq, model)
-    ram_encoder_hidden_states = model.generate_image_embeds(lq)
 
-    # validation_prompt = f"{res[0]}, {args.prompt},"
-    #
-    # return validation_prompt, ram_encoder_hidden_states
+    # 2) 提取 RAM 特征
+    raw_feats = tag_model.generate_image_embeds(lq)
 
-    if hasattr(args, 'use_phrase_enhancement') and args.use_phrase_enhancement:
-        # 假设res[0]是一个逗号分隔的标签字符串
-        tags = [tag.strip() for tag in res[0].split(',')]
-        enhanced_tags = phrase_generator.enhance_prompt(tags)
-        validation_prompt = f"{enhanced_tags}, {args.prompt},"
+    # 3) 池化到 [1, dim]
+    if raw_feats.dim() == 4:
+        ram_states = F.adaptive_avg_pool2d(raw_feats, 1).view(1, -1)
+    elif raw_feats.dim() == 3:
+        ram_states = raw_feats.mean(dim=1)
     else:
-        validation_prompt = f"{res[0]}, {args.prompt},"
+        ram_states = raw_feats
 
-    return validation_prompt, ram_encoder_hidden_states
+    # 4) 生成粗标签嵌入
+    res = inference(lq, tag_model)
+    inputs = tokenizer(
+        res[0],
+        padding="max_length",
+        truncation=True,
+        max_length=tokenizer.model_max_length,
+        return_tensors="pt"
+    ).to(device)
+    text_feats = text_encoder(**inputs).last_hidden_state
+    tag_embeds = text_feats.mean(dim=1)
+
+    enhanced_embeds = None
+    extra_words = None
+
+    # 5) 如果有 GAN，就升维、跑 GAN，再解码 top_k 词
+    if gan_model is not None and project_tag_embeds is not None:
+        gan_input = project_tag_embeds(tag_embeds)  # [1,1024]
+        enhanced_embeds = gan_model(gan_input, ram_states)  # [1,1024]
+
+        # ==== DEBUG BEGIN ====
+        # 1) 拿到 CLIP 的词向量矩阵
+        emb_matrix = text_encoder.get_input_embeddings().weight  # [vocab_size, 768]
+        # 先把 enhanced_embeds decode 回 768 维
+        decoded = decode_tag_embeds(enhanced_embeds) if decode_tag_embeds else None
+        # 2) 计算 GAN 输入 vs 输出 的向量差距
+        delta_norm = (gan_input - enhanced_embeds).norm().item()
+        # 3) 如果你能 decode 回 768，再对比 logits 差异
+        if decode_tag_embeds is not None:
+            decoded = decode_tag_embeds(enhanced_embeds)  # [1,768]
+            logits_orig = gan_input @ emb_matrix.t()  # [1, vocab_size]
+            logits_new = decoded @ emb_matrix.t()  # [1, vocab_size]
+            avg_diff = (logits_new - logits_orig).abs().mean().item()
+            print(f"[DEBUG] Δ-norm: {delta_norm:.4f}, avg-logit-diff: {avg_diff:.4f}")
+        else:
+            print(f"[DEBUG] Δ-norm: {delta_norm:.4f} (no decode branch)")
+        # ==== DEBUG END ====
+
+        if decode_tag_embeds is not None:
+            decoded = decode_tag_embeds(enhanced_embeds)     # [1,768]
+            emb_matrix = text_encoder.get_input_embeddings().weight  # [vocab,768]
+            logits = decoded @ emb_matrix.t()               # [1, vocab]
+            topk_ids = torch.topk(logits, top_k, dim=-1).indices[0].tolist()
+            extra_words = tokenizer.decode(
+                topk_ids, skip_special_tokens=True
+            ).replace("  ", " ").strip()
+
+        # 构造包含 extra_words 的 prompt
+        if extra_words:
+            prompt = f"{res[0]}, {extra_words}, {args.prompt},"
+        else:
+            prompt = f"{res[0]}, {args.prompt},"
+
+        return prompt, ram_states, enhanced_embeds
+
+    # —— 非 GAN 时也要返回三元组 ——
+    prompt = f"{res[0]}, {args.prompt},"
+    return prompt, ram_states, None
+
 
 def main(args, enable_xformers_memory_efficient_attention=True,):
+    global project_tag_embeds, decode_tag_embeds
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    from transformers import AutoTokenizer, AutoModel
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+    text_encoder = AutoModel.from_pretrained("bert-base-uncased").to(device)
+
     txt_path = os.path.join(args.output_dir, 'txt')
     os.makedirs(txt_path, exist_ok=True)
 
@@ -183,8 +277,20 @@ def main(args, enable_xformers_memory_efficient_attention=True,):
         accelerator.init_trackers("SeeSR")
 
     pipeline = load_seesr_pipeline(args, accelerator, enable_xformers_memory_efficient_attention)
-    model = load_tag_model(args, accelerator.device)
- 
+    tag_model = load_tag_model(args, accelerator.device)
+    gan_model = load_gan_model(args, accelerator.device) if args.use_gan else None
+
+    # 加载GAN模型
+    if args.use_gan:
+        gan_model = load_gan_model(args, device)
+        # project_tag_embeds = nn.Linear(768, 1024).to(accelerator.device)
+        project_tag_embeds = project_tag_embeds
+        decode_tag_embeds = decode_tag_embeds
+    else:
+        gan_model = None
+        project_tag_embeds = None
+        decode_tag_embeds = None
+
     if accelerator.is_main_process:
         generator = torch.Generator(device=accelerator.device)
         if args.seed is not None:
@@ -198,11 +304,44 @@ def main(args, enable_xformers_memory_efficient_attention=True,):
         for image_idx, image_name in enumerate(image_names[:]):
             print(f'================== process {image_idx} imgs... ===================')
             validation_image = Image.open(image_name).convert("RGB")
+            # 无论 args.use_gan，get_validation_prompt 都返回 (prompt, ram_states, enhanced_embeds)
+            validation_prompt, ram_states, enhanced_embeds = get_validation_prompt(
+                args, validation_image, tag_model,
+                tokenizer, text_encoder,
+                project_tag_embeds,decode_tag_embeds, gan_model,
+                device=accelerator.device
+            )
+            validation_prompt = validation_prompt + args.added_prompt
+            negative_prompt = args.negative_prompt
 
-            validation_prompt, ram_encoder_hidden_states = get_validation_prompt(args, validation_image, model)
-            validation_prompt += args.added_prompt # clean, extremely detailed, best quality, sharp, clean
-            negative_prompt = args.negative_prompt #dirty, messy, low quality, frames, deformed, 
-            
+            # if args.use_gan:
+            #     # 带 GAN 分支，多拿一个 enhanced_embeds
+            #     validation_prompt, ram_states, enhanced_embeds = get_validation_prompt(
+            #         args=args,
+            #         image=validation_image,
+            #         tag_model=tag_model,
+            #         tokenizer=tokenizer,
+            #         text_encoder=text_encoder,
+            #         project_tag_embeds=project_tag_embeds,
+            #         gan_model=gan_model,
+            #         device=accelerator.device,
+            #     )
+            # else:
+            #     # 原版流程，只要两项
+            #     validation_prompt, ram_states, enhanced_embeds = get_validation_prompt(
+            #         args=args,
+            #         image=validation_image,
+            #         tag_model=tag_model,
+            #         tokenizer=tokenizer,
+            #         text_encoder=text_encoder,
+            #         project_tag_embeds=None,
+            #         gan_model=None,
+            #         device=accelerator.device,
+            #     )
+
+            # validation_prompt += args.added_prompt # clean, extremely detailed, best quality, sharp, clean
+            # negative_prompt = args.negative_prompt #dirty, messy, low quality, frames, deformed,
+
             if args.save_prompts:
                 txt_save_path = f"{txt_path}/{os.path.basename(image_name).split('.')[0]}.txt"
                 file = open(txt_save_path, "w")
@@ -230,16 +369,86 @@ def main(args, enable_xformers_memory_efficient_attention=True,):
             for sample_idx in range(args.sample_times):
                 os.makedirs(f'{args.output_dir}/sample{str(sample_idx).zfill(2)}/', exist_ok=True)
 
-            for sample_idx in range(args.sample_times):  
+            if gan_model is not None:
+                validation_prompt, ram_encoder_hidden_states, enhanced_tag_embeds = get_validation_prompt(
+                    args,
+                    validation_image,
+                    tag_model,tokenizer,
+                    text_encoder,
+                    project_tag_embeds,
+                    gan_model)
+            else:
+                validation_prompt, ram_states, enhanced_embeds = get_validation_prompt(
+                    args, validation_image, tag_model, tokenizer, text_encoder, None, None,
+                device = accelerator.device)
+
+            tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_path, subfolder="tokenizer")
+            text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_path, subfolder="text_encoder").to(
+                accelerator.device)
+
+            for sample_idx in range(args.sample_times):
                 with torch.autocast("cuda"):
-                    image = pipeline(
-                            validation_prompt, validation_image, num_inference_steps=args.num_inference_steps, generator=generator, height=height, width=width,
-                            guidance_scale=args.guidance_scale, negative_prompt=negative_prompt, conditioning_scale=args.conditioning_scale,
-                            start_point=args.start_point, ram_encoder_hidden_states=ram_encoder_hidden_states,
-                            latent_tiled_size=args.latent_tiled_size, latent_tiled_overlap=args.latent_tiled_overlap,
-                            args=args,
-                        ).images[0]
-                
+                    # —— 1) 先用 CLIPTokenizer + CLIPTextModel 得到 prompt_embeds 和 negative_prompt_embeds ——
+                    input_ids = tokenizer(
+                        validation_prompt,
+                        padding="max_length",
+                        truncation=True,
+                        max_length=tokenizer.model_max_length,
+                        return_tensors="pt",
+                    )
+                    prompt_embeds = text_encoder(input_ids.input_ids.to(accelerator.device)).last_hidden_state
+
+                    neg_ids = tokenizer(
+                        negative_prompt,
+                        padding="max_length",
+                        truncation=True,
+                        max_length=tokenizer.model_max_length,
+                        return_tensors="pt",
+                    )
+                    negative_prompt_embeds = text_encoder(neg_ids.input_ids.to(accelerator.device)).last_hidden_state
+
+                    # —— 2) 把 ram_states 扩展到 [B, seq_len, dim] ——
+                    batch_size, seq_len, _ = prompt_embeds.shape
+                    dim = ram_states.shape[1]
+                    controlnet_embeds = ram_states.unsqueeze(1).expand(batch_size, seq_len, dim)
+
+                    # —— 3) 根据 enhanced_embeds 决定传不传 extra branch ——
+                    if enhanced_embeds is not None:
+                        out = pipeline(
+                            prompt=None,
+                            prompt_embeds=prompt_embeds,
+                            negative_prompt_embeds=negative_prompt_embeds,
+                            image=validation_image,
+                            ram_encoder_hidden_states=controlnet_embeds,
+                            enhanced_tag_embeds=enhanced_embeds,
+                            num_inference_steps=args.num_inference_steps,
+                            guidance_scale=args.guidance_scale,
+                            conditioning_scale=args.conditioning_scale,
+                            start_point=args.start_point,
+                            generator=generator,
+                            height=height, width=width,
+                            latent_tiled_size=args.latent_tiled_size,
+                            latent_tiled_overlap=args.latent_tiled_overlap,
+                        )
+                    else:
+                        out = pipeline(
+                            prompt=None,
+                            prompt_embeds=prompt_embeds,
+                            negative_prompt_embeds=negative_prompt_embeds,
+                            image=validation_image,
+                            ram_encoder_hidden_states=controlnet_embeds,
+                            num_inference_steps=args.num_inference_steps,
+                            guidance_scale=args.guidance_scale,
+                            conditioning_scale=args.conditioning_scale,
+                            start_point=args.start_point,
+                            generator=generator,
+                            height=height, width=width,
+                            latent_tiled_size=args.latent_tiled_size,
+                            latent_tiled_overlap=args.latent_tiled_overlap,
+                        )
+
+                    image = out.images[0]
+
                 if args.align_method == 'nofix':
                     image = image
                 else:
@@ -284,6 +493,8 @@ if __name__ == "__main__":
     parser.add_argument("--save_prompts", action='store_true')
     parser.add_argument("--use_phrase_enhancement", action="store_true",
                         help="Enhance tags with attributive + noun phrases")
+    parser.add_argument("--use_gan", action='store_true', help="Whether to use GAN for prompt enhancement")
+    parser.add_argument("--gan_model_path", type=str, default="F:/PyCharmProjects/SeeSR/preset/models/prompt_gan/select/generator_epoch_100.pth")
     parser.add_argument("--vocabulary_path", type=str, default="F:/PyCharmProjects/SeeSR/lexicon.json",
                         help="The path to the vocabulary JSON file")
     args = parser.parse_args()
