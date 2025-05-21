@@ -11,95 +11,96 @@ from ram import inference_ram as inference
 from torchvision import transforms
 import torch.nn.functional as F
 from PIL import Image
-
+import os, json, random
+import pandas as pd
+from torch.utils.data import Dataset
+from transformers import CLIPTokenizer, CLIPTextModel
+from ram.models.ram_lora import ram
+from ram import inference_ram as inference
+import torch.nn.functional as F
+from PIL import Image
+from torchvision import transforms
 
 class PromptEnhancementDataset(Dataset):
-    def __init__(self, image_dir, high_quality_prompts_file, pretrained_model_path, ram_model_path, device='cuda'):
-        self.image_paths = [os.path.join(image_dir, f) for f in os.listdir(image_dir) if
-                            f.endswith(('.png', '.jpg', '.jpeg'))]
+    def __init__(self, image_dir, csv_file, pretrained_model_path, ram_model_path, device='cuda'):
+        self.image_dir = image_dir
         self.device = device
 
-        # 加载高质量提示词
-        with open(high_quality_prompts_file, 'r', encoding='utf-8') as f:
-            self.high_quality_prompts = [line.strip() for line in f.readlines()]
+        # 读取 CSV 并解析 raw 列
+        df = pd.read_csv(csv_file)
+        df['raw_list'] = df['raw'].apply(json.loads)
+        # 可选：根据 split 列划分数据集
+        # df = df[df['split'] == 'train']
 
-            # 确保提示词数量与图像数量匹配
-        assert len(self.image_paths) == len(self.high_quality_prompts), "图像数量和提示词数量必须匹配"
+        # 构建样本列表
+        self.samples = []
+        for _, row in df.iterrows():
+            img_path = os.path.join(image_dir, row['filename'])
+            if not os.path.isfile(img_path):
+                raise FileNotFoundError(f"Missing image file: {img_path}")
+            self.samples.append((img_path, row['raw_list']))
 
-        # 加载RAM模型
-        self.ram_model = ram(pretrained='preset/models/ram_swin_large_14m.pth',
-                             pretrained_condition=ram_model_path,
-                             image_size=384,
-                             vit='swin_l')
-        self.ram_model.eval()
-        self.ram_model.to(device)
+        # 加载 RAM 模型
+        self.ram_model = ram(
+            pretrained='preset/models/ram_swin_large_14m.pth',
+            pretrained_condition=ram_model_path,
+            image_size=384,
+            vit='swin_l'
+        )
+        self.ram_model.eval().to(device)
 
-        # 加载CLIP模型
+        # 加载 CLIP 文本编码器
         self.tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_path, subfolder="tokenizer")
         self.text_encoder = CLIPTextModel.from_pretrained(pretrained_model_path, subfolder="text_encoder")
-        self.text_encoder.eval()
-        self.text_encoder.to(device)
+        self.text_encoder.eval().to(device)
 
-        # 图像转换
-        self.tensor_transforms = transforms.Compose([transforms.ToTensor()])
+        # 图像预处理
+        self.to_tensor = transforms.ToTensor()
         self.ram_transforms = transforms.Compose([
             transforms.Resize((384, 384)),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        # （1）加载并预处理图像
-        image = Image.open(self.image_paths[idx]).convert("RGB")
-        lq = self.tensor_transforms(image).unsqueeze(0).to(self.device)
+        img_path, raw_prompts = self.samples[idx]
+
+        # 图像 → RAM 嵌入
+        image = Image.open(img_path).convert("RGB")
+        lq = self.to_tensor(image).unsqueeze(0).to(self.device)
         lq = self.ram_transforms(lq)
-
-        # （2）得到 RAM 原始特征，可能是 [1, C, H, W] 或 [1, seq_len, D]
         raw_feats = self.ram_model.generate_image_embeds(lq)
-
-        # —— 全局池化/平均到 [1, D] ——
         if raw_feats.dim() == 4:
-            pooled = F.adaptive_avg_pool2d(raw_feats, 1)  # -> [1, C, 1, 1]
-            image_embeds = pooled.view(1, -1)  # -> [1, C]
-        elif raw_feats.dim() == 3:
-            image_embeds = raw_feats.mean(dim=1, keepdim=True)  # -> [1, 1, D]
+            pooled = F.adaptive_avg_pool2d(raw_feats, 1).view(1, -1)
+            ram_states = pooled.squeeze(0)
         else:
-            image_embeds = raw_feats  # 可能已是 [1, D] 或 [1, 1]
+            ram_states = raw_feats.mean(dim=1).squeeze(0)
 
-        # —— squeeze 所有 leading-1 dims ——
-        image_embeds = image_embeds.squeeze()  # -> [C] 或 [D]
-
-        # （3）得到粗糙标签和高质量标签的文本向量
+        # RAM prompt → 粗标签嵌入
         res = inference(lq, self.ram_model)
         inputs = self.tokenizer(
-            res[0],
-            padding="max_length",
+            res[0], padding="max_length", truncation=True,
             max_length=self.tokenizer.model_max_length,
-            truncation=True,
             return_tensors="pt"
         ).to(self.device)
-        tag_embeds = self.text_encoder(**inputs).last_hidden_state.mean(dim=1)
-        tag_embeds = tag_embeds.squeeze()  # -> [text_dim]
+        tag_embeds = self.text_encoder(**inputs).last_hidden_state.mean(dim=1).squeeze(0)
 
-        target_inputs = self.tokenizer(
-            self.high_quality_prompts[idx],
-            padding="max_length",
+        # 随机选一条高质量提示进行训练
+        sent = random.choice(raw_prompts)
+        toks = self.tokenizer(
+            sent, padding="max_length", truncation=True,
             max_length=self.tokenizer.model_max_length,
-            truncation=True,
             return_tensors="pt"
         ).to(self.device)
-        target_embeds = self.text_encoder(**target_inputs).last_hidden_state.mean(dim=1)
-        target_embeds = target_embeds.squeeze()  # -> [text_dim]
+        target_embeds = self.text_encoder(**toks).last_hidden_state.mean(dim=1).squeeze(0)
 
         return {
-            "tag_embeds": tag_embeds,  # [text_dim]
-            "ram_encoder_hidden_states": image_embeds,  # [img_dim]
-            "target_embeds": target_embeds  # [text_dim]
+            "tag_embeds": tag_embeds,                  # [768]
+            "ram_encoder_hidden_states": ram_states,   # [D]
+            "target_embeds": target_embeds             # [768]
         }
-
-    # 训练函数
 
 
 def train(args):
@@ -136,6 +137,8 @@ def train(args):
         for i, batch in enumerate(dataloader):
             tag_embeds = batch["tag_embeds"]
             ram_encoder_hidden_states = batch["ram_encoder_hidden_states"]
+            target_embeds = batch["target_embeds"]
+
             target_embeds = batch["target_embeds"]
 
             print(f"[DEBUG] tag_embeds.shape = {tag_embeds.shape}")
@@ -200,7 +203,7 @@ def train(args):
                 )
 
                 # 每个epoch保存一次模型
-        if (epoch + 1) % args.save_freq == 0:
+        if (epoch + 1) % 1 == 0:
             os.makedirs(args.output_dir, exist_ok=True)
             torch.save(generator.state_dict(), f"{args.output_dir}/generator_epoch_{epoch + 1}.pth")
             torch.save(discriminator.state_dict(), f"{args.output_dir}/discriminator_epoch_{epoch + 1}.pth")
@@ -208,8 +211,8 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image_dir", type=str, required=True, help="F:/PyCharmProjects/SeeSR/GAN/img/test/")
-    parser.add_argument("--prompts_file", type=str, required=True, help="F:/PyCharmProjects/SeeSR/GAN/txt/for text/prompt.txt")
+    parser.add_argument("--image_dir", type=str, required=False, default="F:/PyCharmProjects/SeeSR/GAN/img/train2014/flickr30k-images")
+    parser.add_argument("--prompts_file", type=str, required=False, default="F:/PyCharmProjects/SeeSR/GAN/txt/flickr_annotations_10k.csv")
     parser.add_argument("--pretrained_model_path", type=str, default="preset/models/stable-diffusion-2-base",
                         help="pre-trained model path")
     parser.add_argument("--ram_model_path", type=str, default="preset/models/DAPE.pth", help="RAM model path")
