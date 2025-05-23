@@ -1,55 +1,67 @@
+# prompt_gan_model.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-
-class PromptEnhancementGenerator(nn.Module):
-    def __init__(self, tag_dim=768, image_embed_dim=512, hidden_dim=1024):
+class UNetEncoder(nn.Module):
+    def __init__(self, in_channels=3, base_channels=64):
         super().__init__()
-        self.tag_encoder = nn.Linear(tag_dim, hidden_dim)
-        self.image_encoder = nn.Linear(image_embed_dim, hidden_dim)
-
-        self.layers = nn.Sequential(
-            nn.LayerNorm(hidden_dim * 2),
-            nn.Linear(hidden_dim * 2, hidden_dim * 2),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim * 2),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, tag_dim)
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.enc2 = nn.Sequential(
+            nn.MaxPool2d(2),
+            nn.Conv2d(base_channels, base_channels * 2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
         )
 
-    def forward(self, tag_embeds, image_embeds):
-        tag_features = self.tag_encoder(tag_embeds)
-        image_features = self.image_encoder(image_embeds)
-        combined = torch.cat([tag_features, image_features], dim=-1)
-        enhanced_tag_embeds = self.layers(combined)
-        return enhanced_tag_embeds
+    def forward(self, x):
+        x1 = self.enc1(x)       # [B, 32, H, W]
+        x2 = self.enc2(x1)      # [B, 64, H/2, W/2]
+        return x1, x2
 
 
-class PromptEnhancementDiscriminator(nn.Module):
-    def __init__(self, tag_dim=768, image_embed_dim=512, hidden_dim=1024):
+class UNetDecoder(nn.Module):
+    def __init__(self, base_channels=64, out_channels=91):
         super().__init__()
-        self.tag_encoder = nn.Linear(tag_dim, hidden_dim)
-        self.image_encoder = nn.Linear(image_embed_dim, hidden_dim)
+        self.up1 = nn.ConvTranspose2d(base_channels * 2, base_channels, kernel_size=2, stride=2)
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(base_channels * 2, base_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.out_conv = nn.Conv2d(base_channels, out_channels, kernel_size=1)
 
-        self.layers = nn.Sequential(
-            nn.LayerNorm(hidden_dim * 2),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.Linear(hidden_dim // 2, 1)
+    def forward(self, x1, x2):
+        u1 = self.up1(x2)
+        x = self.dec1(torch.cat([u1, x1], dim=1))
+        out = self.out_conv(x)
+        return out
+
+
+class PromptGenerator(nn.Module):
+    def __init__(self, input_dim=512, hidden_dim=256, output_dim=91):
+        super().__init__()
+        self.encoder = UNetEncoder(in_channels=3, base_channels=32)
+        self.decoder = UNetDecoder(base_channels=32, out_channels=output_dim)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+
+    def forward(self, x):
+        x1, x2 = self.encoder(x)
+        logits_map = self.decoder(x1, x2)
+        pooled = self.pool(logits_map).squeeze(-1).squeeze(-1)
+        return pooled
+
+# ====================== Discriminator ======================
+class PromptDiscriminator(nn.Module):
+    def __init__(self, input_dim=91):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.LeakyReLU(0.2),
+            nn.Linear(256, 1),
+            nn.Sigmoid()
         )
 
-    def forward(self, tag_embeds, image_embeds):
-        if image_embeds.dim() == 4:
-            image_embeds = torch.nn.functional.adaptive_avg_pool2d(image_embeds, 1)
-            image_embeds = image_embeds.view(image_embeds.size(0), -1)
-
-        tag_features = self.tag_encoder(tag_embeds)
-        image_features = self.image_encoder(image_embeds)
-        combined = torch.cat([tag_features, image_features], dim=-1)
-        return self.layers(combined)
+    def forward(self, x):
+        return self.net(x)
