@@ -28,11 +28,6 @@ import tempfile
 import shutil
 
 def load_and_align(gt_path: str, pred_path: str):
-    """
-    1) 打开 GT 和 Pred，两者统一转 RGB。
-    2) 将 Pred 等比例缩放（双三次）到与 GT 完全相同的 (width, height)。
-    3) 返回归一化到 [0,1] 的 numpy 数组。
-    """
     gt = Image.open(gt_path).convert('RGB')
     pred = Image.open(pred_path).convert('RGB')
 
@@ -44,7 +39,7 @@ def load_and_align(gt_path: str, pred_path: str):
     return gt_np, pred_np
 
 def resize_images_to_dir(src_dir, target_size=(299, 299)):
-    """将 src_dir 中的所有图像 resize 到指定大小，保存到临时目录，并返回路径。"""
+    # resize all the images in src_dir to the specified size, save them to the temporary directory, and return the path
     tmp_dir = tempfile.mkdtemp()
     for img_name in os.listdir(src_dir):
         img_path = os.path.join(src_dir, img_name)
@@ -58,14 +53,14 @@ def resize_images_to_dir(src_dir, target_size=(299, 299)):
 def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # 准备 LPIPS 模型
+    # Prepare the LPIPS model
     lpips_model = lpips.LPIPS(net='alex').to(device)
 
-    # Resize 图像以保证 FID 能正常堆叠计算
+    # Resize the image to ensure that the FID can be stacked and calculated normally
     gt_resized_dir = resize_images_to_dir(args.gt_dir)
     pred_resized_dir = resize_images_to_dir(args.pred_dir)
 
-    # 计算 FID
+    # Calculate FID
     fid_value = fid_score.calculate_fid_given_paths(
         [gt_resized_dir, pred_resized_dir],
         batch_size=32,
@@ -74,16 +69,16 @@ def main(args):
         num_workers=0
     )
 
-    # 清理临时目录
+    # Clean up the temporary directory
     shutil.rmtree(gt_resized_dir)
     shutil.rmtree(pred_resized_dir)
 
-    # 遍历所有图像计算其他指标
+    # Traverse all the images to calculate other indicators
     results = []
     gt_paths   = sorted(glob.glob(os.path.join(args.gt_dir,  '*')))
     pred_paths = sorted(glob.glob(os.path.join(args.pred_dir, '*')))
 
-    # 初始化指标
+    # Initialization index
     dists_metric = piq.DISTS().to(device)
     # niqe_metric = piq.NIQE()
 
@@ -110,7 +105,7 @@ def main(args):
         pred_t = torch.from_numpy(pred).permute(2, 0, 1).unsqueeze(0).to(device).float()
         dists_val = dists_metric(pred_t, gt_t).item()
 
-        # NIQE（注意 NIQE 只接受灰度或 RGB 格式，图像尺寸需 >= 96x96）
+        # NIQE
         # niqe_val = niqe_metric(pred_t).item()
 
         results.append({
@@ -122,7 +117,7 @@ def main(args):
             # 'NIQE': niqe_val,
         })
 
-    # 添加 FID 作为一行
+    # Add FID
     df = pd.DataFrame(results)
     fid_row = {k: None for k in df.columns}
     fid_row['image'] = 'all'
