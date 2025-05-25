@@ -59,7 +59,7 @@ def train_step(generator, discriminator, images, labels_text, adjectives_real, o
         adj_real_tokens = clip_model.get_text_features(**CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")(
             text=adjectives_real, return_tensors="pt", padding=True).to(device))
 
-    # ========== Train Discriminator ==========
+    #Train Discriminator
     generator.eval()
     discriminator.train()
 
@@ -81,7 +81,7 @@ def train_step(generator, discriminator, images, labels_text, adjectives_real, o
     loss_D.backward()
     optimizer_D.step()
 
-    # ========== Train Generator ==========
+    #Train Generator
     generator.train()
     discriminator.eval()
 
@@ -95,7 +95,7 @@ def train_step(generator, discriminator, images, labels_text, adjectives_real, o
 
     D_fake_for_G = discriminator(images, label_tokens, adj_fake_tokens)
 
-    # Clip reward loss
+    #Clip reward loss
     with torch.no_grad():
         image_features = clip_model.get_image_features(images)
     clip_sim = cosine_similarity(image_features, adj_fake_tokens)
