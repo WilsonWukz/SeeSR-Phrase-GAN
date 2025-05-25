@@ -51,17 +51,12 @@ lexicon = {
 # Save to file
 from pathlib import Path
 
-# 获取当前脚本所在目录
+#Obtain the directory where the current script is located
 base_dir = Path(__file__).resolve().parent
-
-# 构造输出路径
 out_path = base_dir / 'lexicon.json'
-
-# 写文件
 with out_path.open('w', encoding='utf-8') as f:
     json.dump(lexicon, f, ensure_ascii=False, indent=2)
 print(f"Saved lexicon to {out_path}")
-
 
 # Display a preview
 import pandas as pd
