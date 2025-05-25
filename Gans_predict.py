@@ -30,22 +30,20 @@ def predict_adjectives(image, generator, vocab_words, clip_model, preprocess):
 
 
 if __name__ == "__main__":
-    # ===== 路径设置 =====
     vocab_path = "E:/Sydney_study/5329/A2/COCO/vocab_words.txt"
     model_path = "E:/Sydney_study/5329/A2/flickr/model/coco_generator2.pth"
     image_path = "E:/Sydney_study/5329/A2/RealSR (ICCV2019)/Nikon/Test/3/Nikon_012_LR3.png"
 
-    # ===== 加载组件 =====
+    #Load the components at this step
     device = "cuda" if torch.cuda.is_available() else "cpu"
     clip_model, preprocess = clip.load("ViT-B/32", device=device)
     vocab_words = load_vocab(vocab_path)
     print(len(vocab_words))
     generator = load_generator(model_path, output_dim=len(vocab_words), device=device)
 
-    # ✅ 加载图像对象（PIL.Image）而不是路径字符串
+    #Load the image object（PIL.Image）
     image = Image.open(image_path).convert("RGB")
 
-    # ===== 推理 =====
     adjectives = predict_adjectives(image, generator, vocab_words, clip_model, preprocess)
     print(len(adjectives))
-    print("预测形容词列表:", adjectives)
+    print("List of predicted adjectives:", adjectives)
