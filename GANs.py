@@ -1,0 +1,113 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import CLIPProcessor, CLIPModel
+from torchvision import models
+
+# 加载预训练 CLIP 模型（你可以换成 openai 的 clip 库）
+clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+clip_model.eval()
+for param in clip_model.parameters():
+    param.requires_grad = False
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+clip_model.to(device)
+class Generator(nn.Module):
+    def __init__(self, adj_vocab_size, clip_text_dim=512):
+        super(Generator, self).__init__()
+        self.image_encoder = models.resnet18(pretrained=True)
+        self.image_encoder.fc = nn.Identity()
+
+        self.fc = nn.Sequential(
+            nn.Linear(512 + clip_text_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, adj_vocab_size)  # 输出词表中某个形容词的概率
+        )
+
+    def forward(self, image, label_embedding):  # label_embedding 是 CLIP encode_text(label) 输出
+        img_feat = self.image_encoder(image)  # [B, 512]
+        x = torch.cat([img_feat, label_embedding], dim=1)  # [B, 512 + 512]
+        return self.fc(x)  # [B, vocab_size]
+
+class Discriminator(nn.Module):
+    def __init__(self, clip_text_dim=512):
+        super(Discriminator, self).__init__()
+        self.image_encoder = models.resnet18(pretrained=True)
+        self.image_encoder.fc = nn.Identity()
+
+        self.fc = nn.Sequential(
+            nn.Linear(512 + 2 * clip_text_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, image, label_emb, adj_emb):
+        img_feat = self.image_encoder(image)
+        x = torch.cat([img_feat, label_emb, adj_emb], dim=1)
+        return self.fc(x)  # 返回匹配的概率
+
+def cosine_similarity(a, b):
+    a = F.normalize(a, dim=-1)
+    b = F.normalize(b, dim=-1)
+    return (a * b).sum(dim=-1)
+
+def train_step(generator, discriminator, images, labels_text, adjectives_real, optimizer_G, optimizer_D, vocab, clip_model, lambda_clip=0.5):
+    # encode texts
+    with torch.no_grad():
+        label_tokens = clip_model.get_text_features(**CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")(
+            text=labels_text, return_tensors="pt", padding=True).to(device))
+        adj_real_tokens = clip_model.get_text_features(**CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")(
+            text=adjectives_real, return_tensors="pt", padding=True).to(device))
+
+    # ========== Train Discriminator ==========
+    generator.eval()
+    discriminator.train()
+
+    # Generator 生成 adjective 的概率分布
+    adj_logits_fake = generator(images, label_tokens)  # [B, vocab_size]
+    adj_fake_idx = adj_logits_fake.argmax(dim=1)
+    adj_fake_words = [vocab[i] for i in adj_fake_idx.tolist()]
+
+    with torch.no_grad():
+        adj_fake_tokens = clip_model.get_text_features(**CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")(
+            text=adj_fake_words, return_tensors="pt", padding=True).to(device))
+
+    D_real = discriminator(images, label_tokens, adj_real_tokens)
+    D_fake = discriminator(images, label_tokens, adj_fake_tokens)
+
+    loss_D = -torch.mean(torch.log(D_real + 1e-8) + torch.log(1 - D_fake + 1e-8))
+
+    optimizer_D.zero_grad()
+    loss_D.backward()
+    optimizer_D.step()
+
+    # ========== Train Generator ==========
+    generator.train()
+    discriminator.eval()
+
+    adj_logits_fake = generator(images, label_tokens)
+    adj_fake_idx = adj_logits_fake.argmax(dim=1)
+    adj_fake_words = [vocab[i] for i in adj_fake_idx.tolist()]
+
+    with torch.no_grad():
+        adj_fake_tokens = clip_model.get_text_features(**CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")(
+            text=adj_fake_words, return_tensors="pt", padding=True).to(device))
+
+    D_fake_for_G = discriminator(images, label_tokens, adj_fake_tokens)
+
+    # Clip reward loss
+    with torch.no_grad():
+        image_features = clip_model.get_image_features(images)
+    clip_sim = cosine_similarity(image_features, adj_fake_tokens)
+
+    loss_G = -torch.mean(torch.log(D_fake_for_G + 1e-8)) - lambda_clip * torch.mean(clip_sim)
+
+    optimizer_G.zero_grad()
+    loss_G.backward()
+    optimizer_G.step()
+
+    return loss_G.item(), loss_D.item()
+
+vocab = ["black", "white", "fluffy", "striped", "orange", "shiny", "angry", "cute"]
+vocab_dict = {word: i for i, word in enumerate(vocab)}

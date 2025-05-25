@@ -43,7 +43,7 @@ from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
 from dataloaders.paired_dataset import PairedCaptionDataset
-
+PairedCaptionDataset
 from typing import Mapping, Any
 from torchvision import transforms
 import torch.nn as nn

@@ -24,9 +24,6 @@ from ram import inference_ram as inference
 from torchvision import transforms
 from models.controlnet import ControlNetModel
 from models.unet_2d_condition import UNet2DConditionModel
-from utils_text.phrase_generator import PhraseGenerator
-
-phrase_generator = PhraseGenerator("F:/PyCharmProjects/SeeSR/lexicon.json")
 
 tensor_transforms = transforms.Compose([
                 transforms.ToTensor(),
@@ -99,8 +96,7 @@ def process(
     seed: int,
     latent_tiled_size: int,
     latent_tiled_overlap: int,
-    sample_times: int,
-    use_phrase_enhancement: bool = False
+    sample_times: int
     ) -> List[np.ndarray]:
     process_size = 512
     resize_preproc = transforms.Compose([
@@ -116,16 +112,8 @@ def process(
     lq = ram_transforms(lq)
     res = inference(lq, tag_model)
     ram_encoder_hidden_states = tag_model.generate_image_embeds(lq)
-    # validation_prompt = f"{res[0]}, {positive_prompt},"
-    # validation_prompt = validation_prompt if user_prompt=='' else f"{user_prompt}, {validation_prompt}"
-    if use_phrase_enhancement:
-        tags = [tag.strip() for tag in res[0].split(',')]
-        enhanced_tags = phrase_generator.enhance_prompt(tags)
-        validation_prompt = f"{enhanced_tags}, {positive_prompt},"
-    else:
-        validation_prompt = f"{res[0]}, {positive_prompt},"
-
-    validation_prompt = validation_prompt if user_prompt == '' else f"{user_prompt}, {validation_prompt}"
+    validation_prompt = f"{res[0]}, {positive_prompt},"
+    validation_prompt = validation_prompt if user_prompt=='' else f"{user_prompt}, {validation_prompt}"
 
     ori_width, ori_height = input_image.size
     resize_flag = False
@@ -184,7 +172,6 @@ with block:
             input_image = gr.Image(source="upload", type="pil")
             run_button = gr.Button(label="Run")
             with gr.Accordion("Options", open=True):
-                use_phrase_enhancement = gr.Checkbox(label="Use attributive + noun phrase to enhance", value=False)
                 user_prompt = gr.Textbox(label="User Prompt", value="")
                 positive_prompt = gr.Textbox(label="Positive Prompt", value="clean, high-resolution, 8k, best quality, masterpiece")
                 negative_prompt = gr.Textbox(
@@ -213,9 +200,7 @@ with block:
         latent_tiled_size,
         latent_tiled_overlap,
         sample_times,
-        use_phrase_enhancement,
     ]
     run_button.click(fn=process, inputs=inputs, outputs=[result_gallery])
 
 block.launch()
-
