@@ -5,7 +5,7 @@ def resize_images(input_dir: str, output_dir: str, max_size: int = 256):
     os.makedirs(output_dir, exist_ok=True)
 
     for fname in os.listdir(input_dir):
-        # 只处理包含 'LR' 且为图像格式的文件
+        #Only process files containing 'LR' and in image format
         if 'LR' not in fname:
             continue
         if not fname.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
@@ -55,6 +55,6 @@ if __name__ == "__main__":
         output_dir = os.path.normpath(os.path.join(args.output_base_dir, folder, "LR_resized"))
         print(f"\nProcessing: {input_dir} → {output_dir}")
         if not os.path.exists(input_dir):
-            print(f"[跳过] 输入路径不存在: {input_dir}")
+            print(f"[Skip] The input path does not exist: {input_dir}")
             continue
         resize_images(input_dir, output_dir, args.max_size)
